@@ -270,11 +270,22 @@ impl Config {
 
     // load CNI driver config
     pub fn load(&self) -> Result<(), String> {
-        // load config file
-        let contents = std::fs::read_to_string(&self.file)
-            .map_err(|e| format!("failed to read config file {}: {}", self.file, e))?;
-        println!("Loaded config file {}: {}", self.file, contents);
-        Ok(())
+        // Try to load config file
+        match std::fs::read_to_string(&self.file) {
+            Ok(contents) => {
+                println!("Loaded config file {}", self.file);
+                // Parse config...
+                Ok(())
+            },
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    println!("Config file not found, using defaults");
+                    Ok(())
+                } else {
+                    Err(format!("Failed to read config file {}: {}", self.file, e))
+                }
+            }
+        }
     }
 }
 
@@ -330,6 +341,17 @@ mod ipam {
             // Implement IP allocation logic using UpCloud API
             // or a local algorithm
             Ok("10.0.0.2".to_string()) // Placeholder
+        }
+
+        // Add methods to persist and retrieve allocated IPs
+        pub fn persist_allocation(&self, container_id: &str, ip: &str) -> Result<(), String> {
+            // Store allocation in state file
+            Ok(())
+        }
+
+        pub fn get_allocation(&self, container_id: &str) -> Option<String> {
+            // Retrieve allocation from state file
+            None
         }
     }
 }
@@ -500,6 +522,7 @@ mod integration_tests {
 }
 
 mod upcloud_api_client {
+    use std::env;
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug)]
@@ -516,6 +539,15 @@ mod upcloud_api_client {
                 api_password: password.to_string(),
                 mock_mode: false,
             }
+        }
+
+        pub fn from_env() -> Result<Self, String> {
+            let username = env::var("UPCLOUD_API_USERNAME")
+                .map_err(|_| "UPCLOUD_API_USERNAME environment variable not set".to_string())?;
+            let password = env::var("UPCLOUD_API_PASSWORD")
+                .map_err(|_| "UPCLOUD_API_PASSWORD environment variable not set".to_string())?;
+
+            Ok(Self::new(&username, &password))
         }
 
         pub fn with_mock() -> Self {
@@ -535,9 +567,20 @@ mod upcloud_api_client {
                     ip: params.ip.clone().unwrap_or_else(|| "10.10.0.5".to_string()),
                 })
             } else {
-                // In real implementation, call UpCloud API
-                // For now just error out
-                Err("Real API not implemented yet".to_string())
+                // Make actual HTTP request to UpCloud API
+                let client = reqwest::blocking::Client::new();
+                let response = client.post("https://api.upcloud.com/1.3/network-interface")
+                    .basic_auth(&self.api_username, Some(&self.api_password))
+                    .json(params)
+                    .send()
+                    .map_err(|e| format!("API request failed: {}", e))?;
+
+                if !response.status().is_success() {
+                    return Err(format!("API error: {}", response.status()));
+                }
+
+                response.json::<NetworkInterface>()
+                    .map_err(|e| format!("Failed to parse API response: {}", e))
             }
         }
 
