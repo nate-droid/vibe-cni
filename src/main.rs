@@ -396,7 +396,9 @@ mod tests {
     #[test]
     fn test_cni_command_from_env() {
         // Test ADD command
-        unsafe {env::set_var("CNI_COMMAND", "ADD")};
+        // unsafe {env::set_var("CNI_COMMAND", "ADD")};
+        setup_test_env("ADD", "test-container-123", "/proc/1234/ns/net", "eth0");
+        
         let cmd = CniCommand::from_env().unwrap();
         assert!(matches!(cmd, CniCommand::Add));
 
@@ -408,10 +410,7 @@ mod tests {
 
     #[test]
     fn test_cni_environment_from_env() {
-        unsafe {env::set_var("CNI_COMMAND", "ADD")};
-        unsafe {env::set_var("CNI_CONTAINERID", "test-container-456")};
-        unsafe {env::set_var("CNI_NETNS", "/proc/1234/ns/net")};
-        unsafe {env::set_var("CNI_IFNAME", "eth0")};
+        setup_test_env("ADD", "test-container-456", "/proc/1234/ns/net", "eth0");
 
         let env = CniEnvironment::from_env().unwrap();
 
