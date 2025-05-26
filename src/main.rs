@@ -1,316 +1,45 @@
-
-// This is a CNI driver for UpCloud Kubernetes
+use std::collections::HashMap;
+use std::env;
+use std::io::{self, Read, Write};
+use std::net::{IpAddr, Ipv4Addr};
+use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
-use std::env;
-use std::io::{self, Read};
 
-// CNI versioning
-const CNI_VERSION_1_0_0: &str = "1.0.0";
-
-// CNI commands
-#[derive(Debug)]
-enum CniCommand {
-    Add,
-    Del,
-    Check,
-    Version,
-}
-
-impl CniCommand {
-    fn from_env() -> Result<Self, String> {
-        match env::var("CNI_COMMAND").map_err(|e| format!("CNI_COMMAND not set: {}", e))?.as_str() {
-            "ADD" => Ok(CniCommand::Add),
-            "DEL" => Ok(CniCommand::Del),
-            "CHECK" => Ok(CniCommand::Check),
-            "VERSION" => Ok(CniCommand::Version),
-            cmd => Err(format!("Unknown CNI_COMMAND: {}", cmd)),
-        }
-    }
-}
-
-// CNI environment variables
-#[derive(Debug)]
-struct CniEnvironment {
-    command: CniCommand,
-    container_id: Option<String>,
-    netns: Option<String>,
-    ifname: Option<String>,
-    args: Option<String>,
-    path: Option<String>,
-}
-
-impl CniEnvironment {
-    fn from_env() -> Result<Self, String> {
-        Ok(CniEnvironment {
-            command: CniCommand::from_env()?,
-            container_id: env::var("CNI_CONTAINERID").ok(),
-            netns: env::var("CNI_NETNS").ok(),
-            ifname: env::var("CNI_IFNAME").ok(),
-            args: env::var("CNI_ARGS").ok(),
-            path: env::var("CNI_PATH").ok(),
-        })
-    }
-}
-
-fn main() {
-    // initialize CNI driver
-    let mut cni = Cni::new();
-    // initialize CNI driver
-    cni.init().expect("failed to initialize CNI driver");
-    // run CNI driver
-    cni.run().expect("failed to run CNI driver");
-}
-
-// CNI driver struct
-#[derive(Debug)]
-pub struct Cni {
-    // CNI driver name
-    name: String,
-    // CNI driver version
-    version: String,
-    // CNI driver config
-    config: Config,
-}
-
-impl Cni {
-    // create a new CNI driver
-    pub fn new() -> Self {
-        Self {
-            name: "upcloud".to_string(),
-            version: "0.1.0".to_string(),
-            config: Config::new(),
-        }
-    }
-
-    // initialize CNI driver
-    pub fn init(&mut self) -> Result<(), String> {
-        // load config
-        self.config.load()?;
-        Ok(())
-    }
-    pub fn run(&self) -> Result<(), String> {
-        // Get CNI environment
-        let cni_env = CniEnvironment::from_env()?;
-
-        // Read config from stdin
-        let mut stdin = String::new();
-        io::stdin()
-            .read_to_string(&mut stdin)
-            .map_err(|e| format!("Failed to read stdin: {}", e))?;
-
-        // Process based on command
-        match cni_env.command {
-            CniCommand::Add => self.handle_add(&stdin, &cni_env),
-            CniCommand::Del => self.handle_del(&stdin, &cni_env),
-            CniCommand::Check => self.handle_check(&stdin, &cni_env),
-            CniCommand::Version => self.handle_version(),
-        }
-    }
-
-    fn handle_add(&self, config: &str, env: &CniEnvironment) -> Result<(), String> {
-        // Parse the network config
-        let network_config: NetworkConfig = serde_json::from_str(config)
-            .map_err(|e| format!("Failed to parse network config: {}", e))?;
-
-        // Determine if we're in mock mode
-        let client = if network_config.mock.unwrap_or(false) {
-            upcloud_api_client::UpcloudClient::with_mock()
-        } else {
-            // In production, get credentials from env or config file
-            upcloud_api_client::UpcloudClient::new("username", "password")
-        };
-
-        // Create network interface
-        let params = upcloud_api_client::NetworkInterfaceParams {
-            network_id: network_config.name.clone(),
-            ip: None, // Let IPAM assign an IP
-        };
-
-        let interface = client.create_network_interface(&params)?;
-
-        // Output result in CNI format
-        let result = CniResult {
-            cni_version: network_config.cni_version,
-            interfaces: vec![Interface {
-                name: env.ifname.clone().unwrap_or_else(|| "eth0".to_string()),
-                mac: interface.mac,
-                sandbox: env.netns.clone(),
-            }],
-            ips: vec![IPConfig {
-                version: "4".to_string(),
-                address: format!("{}/16", interface.ip),
-                gateway: Some(network_config.ipam.gateway),
-            }],
-            dns: None,
-        };
-
-        println!("{}", serde_json::to_string(&result)
-            .map_err(|e| format!("Failed to serialize result: {}", e))?);
-
-        Ok(())
-    }
-
-    fn handle_del(&self, config: &str, env: &CniEnvironment) -> Result<(), String> {
-        // Parse the network config
-        let network_config: NetworkConfig = serde_json::from_str(config)
-            .map_err(|e| format!("Failed to parse network config: {}", e))?;
-
-        // Determine if we're in mock mode
-        let client = if network_config.mock.unwrap_or(false) {
-            upcloud_api_client::UpcloudClient::with_mock()
-        } else {
-            // In production, get credentials from env or config file
-            upcloud_api_client::UpcloudClient::new("username", "password")
-        };
-
-        // In a real implementation, you'd need to keep track of interface IDs
-        // For the mock implementation, we can just use a placeholder
-        let interface_id = "0123456789";
-
-        // Delete network interface
-        client.delete_network_interface(interface_id)?;
-
-        // DEL command should return empty success
-        println!("{{}}");
-
-        Ok(())
-    }
-
-    fn handle_check(&self, config: &str, env: &CniEnvironment) -> Result<(), String> {
-        // TODO: Implement network validation for container
-        println!("Checking network configuration for container: {:?}", env.container_id);
-        Ok(())
-    }
-
-    fn handle_version(&self) -> Result<(), String> {
-        // Return supported CNI versions
-        let version_info = serde_json::json!({
-            "cniVersion": CNI_VERSION_1_0_0,
-            "supportedVersions": [CNI_VERSION_1_0_0]
-        });
-
-        println!("{}", serde_json::to_string(&version_info)
-            .map_err(|e| format!("Failed to serialize version info: {}", e))?);
-        Ok(())
-    }
-
-    fn handle_add_and_capture(&self, config: &str, env: &CniEnvironment) -> Result<String, String> {
-        // Parse the config
-        let network_config: NetworkConfig = serde_json::from_str(config)
-            .map_err(|e| format!("Failed to parse network config: {}", e))?;
-
-        // Create a result object
-        let result = CniResult {
-            cni_version: network_config.cni_version,
-            interfaces: vec![Interface {
-                name: env.ifname.clone().unwrap_or_else(|| "eth0".to_string()),
-                mac: "00:11:22:33:44:55".to_string(), // Mock MAC address
-                sandbox: env.netns.clone(),
-            }],
-            ips: vec![IPConfig {
-                version: "4".to_string(),
-                address: "10.10.0.5/16".to_string(),
-                gateway: Some(network_config.ipam.gateway),
-            }],
-            dns: None,
-        };
-
-        // Serialize to JSON string
-        serde_json::to_string(&result)
-            .map_err(|e| format!("Failed to serialize result: {}", e))
-    }
-
-    pub fn run_and_capture(&self) -> Result<String, String> {
-        let cni_env = CniEnvironment::from_env()?;
-
-        let mut stdin = String::new();
-        io::stdin()
-            .read_to_string(&mut stdin)
-            .map_err(|e| format!("Failed to read stdin: {}", e))?;
-
-        match cni_env.command {
-            CniCommand::Add => self.handle_add_and_capture(&stdin, &cni_env),
-            CniCommand::Del => {
-                self.handle_del(&stdin, &cni_env)?;
-                Ok("{}".to_string()) // Return empty JSON object
-            },
-            CniCommand::Check => {
-                self.handle_check(&stdin, &cni_env)?;
-                Ok("{}".to_string()) // Return empty JSON object
-            },
-            CniCommand::Version => {
-                // Create JSON string for version info
-                let version_info = serde_json::json!({
-                "cniVersion": CNI_VERSION_1_0_0,
-                "supportedVersions": [CNI_VERSION_1_0_0]
-            });
-
-                serde_json::to_string(&version_info)
-                    .map_err(|e| format!("Failed to serialize version info: {}", e))
-            },
-        }
-    }
-}
-
-// CNI driver config struct
-#[derive(Debug)]
-pub struct Config {
-    // CNI driver config file
-    file: String,
-}
-
-impl Config {
-    // create a new CNI driver config
-    pub fn new() -> Self {
-        Self {
-            file: "/etc/cni/net.d/10-upcloud.conf".to_string(),
-        }
-    }
-
-    // load CNI driver config
-    pub fn load(&self) -> Result<(), String> {
-        // Try to load config file
-        match std::fs::read_to_string(&self.file) {
-            Ok(contents) => {
-                println!("Loaded config file {}", self.file);
-                // Parse config...
-                Ok(())
-            },
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    println!("Config file not found, using defaults");
-                    Ok(())
-                } else {
-                    Err(format!("Failed to read config file {}: {}", self.file, e))
-                }
-            }
-        }
-    }
-}
-
+// CNI specification structures
 #[derive(Debug, Serialize, Deserialize)]
-struct NetworkConfig {
+struct CNIConfig {
     #[serde(rename = "cniVersion")]
     cni_version: String,
     name: String,
     #[serde(rename = "type")]
-    type_field: String,
-    ipam: IpamConfig,
-    // UpCloud-specific fields
-    subnet: String,
-    routes: Option<Vec<Route>>,
-    #[serde(default)]
-    mock: Option<bool>,
+    plugin_type: String,
+    bridge: Option<String>,
+    #[serde(rename = "isGateway")]
+    is_gateway: Option<bool>,
+    #[serde(rename = "isDefaultGateway")]
+    is_default_gateway: Option<bool>,
+    #[serde(rename = "forceAddress")]
+    force_address: Option<bool>,
+    #[serde(rename = "ipMasq")]
+    ip_masq: Option<bool>,
+    mtu: Option<u32>,
+    #[serde(rename = "hairpinMode")]
+    hairpin_mode: Option<bool>,
+    ipam: Option<IPAMConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct IpamConfig {
+struct IPAMConfig {
     #[serde(rename = "type")]
-    type_field: String,
-    subnet: String,
-    gateway: String,
-    // More IPAM fields
+    plugin_type: String,
+    subnet: Option<String>,
+    #[serde(rename = "rangeStart")]
+    range_start: Option<String>,
+    #[serde(rename = "rangeEnd")]
+    range_end: Option<String>,
+    gateway: Option<String>,
+    routes: Option<Vec<Route>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -319,393 +48,792 @@ struct Route {
     gw: Option<String>,
 }
 
-mod ipam {
-    use std::net::Ipv4Addr;
-    use std::str::FromStr;
-
-    pub struct IpamManager {
-        subnet: String,
-        gateway: String,
-        // Track allocated IPs
-    }
-
-    impl IpamManager {
-        pub fn new(subnet: &str, gateway: &str) -> Self {
-            Self {
-                subnet: subnet.to_string(),
-                gateway: gateway.to_string(),
-            }
-        }
-
-        pub fn allocate_ip(&mut self) -> Result<String, String> {
-            // Implement IP allocation logic using UpCloud API
-            // or a local algorithm
-            Ok("10.0.0.2".to_string()) // Placeholder
-        }
-
-        // Add methods to persist and retrieve allocated IPs
-        pub fn persist_allocation(&self, container_id: &str, ip: &str) -> Result<(), String> {
-            // Store allocation in state file
-            Ok(())
-        }
-
-        pub fn get_allocation(&self, container_id: &str) -> Option<String> {
-            // Retrieve allocation from state file
-            None
-        }
-    }
+#[derive(Debug, Serialize, Deserialize)]
+struct CNIArgs {
+    #[serde(rename = "containerID")]
+    container_id: String,
+    netns: String,
+    #[serde(rename = "ifName")]
+    if_name: String,
+    args: Option<String>,
+    path: String,
 }
 
-#[derive(Serialize, Debug, PartialEq, Deserialize)]
-struct CniResult {
+#[derive(Debug, Serialize, Deserialize)]
+struct CNIResult {
+    #[serde(rename = "cniVersion")]
     cni_version: String,
     interfaces: Vec<Interface>,
     ips: Vec<IPConfig>,
-    dns: Option<DnsConfig>,
+    routes: Option<Vec<Route>>,
+    dns: Option<DNSConfig>,
 }
 
-#[derive(Serialize, Debug, PartialEq, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct Interface {
     name: String,
-    mac: String,
+    mac: Option<String>,
     sandbox: Option<String>,
 }
 
-#[derive(Serialize, Debug, PartialEq, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct IPConfig {
-    version: String,
     address: String,
     gateway: Option<String>,
+    interface: Option<u32>,
 }
 
-#[derive(Serialize, Debug, PartialEq, Deserialize)]
-struct DnsConfig {
+#[derive(Debug, Serialize, Deserialize)]
+struct DNSConfig {
     nameservers: Vec<String>,
     domain: Option<String>,
     search: Option<Vec<String>>,
     options: Option<Vec<String>>,
 }
 
+#[derive(Debug)]
+struct CNIError {
+    code: u32,
+    msg: String,
+    details: Option<String>,
+}
+
+impl CNIError {
+    fn new(code: u32, msg: &str) -> Self {
+        CNIError {
+            code,
+            msg: msg.to_string(),
+            details: None,
+        }
+    }
+}
+
+struct EbpfCNI {
+    config: CNIConfig,
+    args: CNIArgs,
+}
+
+impl EbpfCNI {
+    fn new() -> Result<Self, CNIError> {
+        // Read CNI config from stdin
+        let mut stdin = io::stdin();
+        let mut config_data = String::new();
+        stdin.read_to_string(&mut config_data)
+            .map_err(|_| CNIError::new(2, "Failed to read config from stdin"))?;
+
+        let config: CNIConfig = serde_json::from_str(&config_data)
+            .map_err(|_| CNIError::new(2, "Failed to parse CNI config"))?;
+
+        // Parse CNI environment variables
+        let container_id = env::var("CNI_CONTAINERID")
+            .map_err(|_| CNIError::new(2, "CNI_CONTAINERID not set"))?;
+        let netns = env::var("CNI_NETNS")
+            .map_err(|_| CNIError::new(2, "CNI_NETNS not set"))?;
+        let if_name = env::var("CNI_IFNAME")
+            .map_err(|_| CNIError::new(2, "CNI_IFNAME not set"))?;
+        let args = env::var("CNI_ARGS").ok();
+        let path = env::var("CNI_PATH")
+            .map_err(|_| CNIError::new(2, "CNI_PATH not set"))?;
+
+        let cni_args = CNIArgs {
+            container_id,
+            netns,
+            if_name,
+            args,
+            path,
+        };
+
+        Ok(EbpfCNI {
+            config,
+            args: cni_args,
+        })
+    }
+
+    fn cmd_add(&self) -> Result<CNIResult, CNIError> {
+        // This is where we'll eventually integrate eBPF programs
+        // For now, let's create a basic bridge setup
+
+        let bridge_name = self.config.bridge.as_deref()
+            .unwrap_or("cni-ebpf0");
+
+        // Create bridge if it doesn't exist
+        self.ensure_bridge(bridge_name)?;
+
+        // Create veth pair
+        let host_veth = format!("veth{}", &self.args.container_id[..8]);
+        let container_veth = &self.args.if_name;
+
+        self.create_veth_pair(&host_veth, container_veth)?;
+
+        // Move container end to netns
+        self.move_to_netns(container_veth, &self.args.netns)?;
+
+        // Attach host end to bridge
+        self.attach_to_bridge(&host_veth, bridge_name)?;
+
+        // Configure IP (basic IPAM for now)
+        let ip = self.allocate_ip()?;
+        self.configure_container_ip(&ip, container_veth)?;
+
+        // TODO: Load eBPF programs here
+        // self.load_ebpf_programs()?;
+
+        Ok(CNIResult {
+            cni_version: self.config.cni_version.clone(),
+            interfaces: vec![
+                Interface {
+                    name: bridge_name.parse().unwrap(),
+                    mac: None,
+                    sandbox: None,
+                },
+                Interface {
+                    name: container_veth.clone(),
+                    mac: None,
+                    sandbox: Some(self.args.netns.clone()),
+                },
+            ],
+            ips: vec![IPConfig {
+                address: format!("{}/24", ip),
+                gateway: Some("10.244.0.1".to_string()),
+                interface: Some(1), // container interface
+            }],
+            routes: Some(vec![Route {
+                dst: "0.0.0.0/0".to_string(),
+                gw: Some("10.244.0.1".to_string()),
+            }]),
+            dns: Some(DNSConfig {
+                nameservers: vec!["8.8.8.8".to_string(), "8.8.4.4".to_string()],
+                domain: None,
+                search: None,
+                options: None,
+            }),
+        })
+    }
+
+    fn cmd_del(&self) -> Result<(), CNIError> {
+        // Clean up veth pair and eBPF programs
+        let host_veth = format!("veth{}", &self.args.container_id[..8]);
+
+        // Delete host veth (container end should be cleaned up with netns)
+        let _ = Command::new("ip")
+            .args(&["link", "del", &host_veth])
+            .output();
+
+        // TODO: Unload eBPF programs here
+        // self.unload_ebpf_programs()?;
+
+        Ok(())
+    }
+
+    fn cmd_check(&self) -> Result<(), CNIError> {
+        // Verify the setup is still valid
+        // TODO: Check eBPF programs are still loaded and functioning
+        Ok(())
+    }
+
+    fn ensure_bridge(&self, bridge_name: &str) -> Result<(), CNIError> {
+        // Check if bridge exists
+        let output = Command::new("ip")
+            .args(&["link", "show", bridge_name])
+            .output()
+            .map_err(|_| CNIError::new(3, "Failed to check bridge"))?;
+
+        if !output.status.success() {
+            // Create bridge
+            Command::new("ip")
+                .args(&["link", "add", bridge_name, "type", "bridge"])
+                .status()
+                .map_err(|_| CNIError::new(3, "Failed to create bridge"))?;
+
+            Command::new("ip")
+                .args(&["link", "set", bridge_name, "up"])
+                .status()
+                .map_err(|_| CNIError::new(3, "Failed to bring bridge up"))?;
+
+            // Set bridge IP
+            Command::new("ip")
+                .args(&["addr", "add", "10.244.0.1/24", "dev", bridge_name])
+                .status()
+                .map_err(|_| CNIError::new(3, "Failed to set bridge IP"))?;
+        }
+
+        Ok(())
+    }
+
+    fn create_veth_pair(&self, host_veth: &str, container_veth: &str) -> Result<(), CNIError> {
+        Command::new("ip")
+            .args(&["link", "add", host_veth, "type", "veth", "peer", "name", container_veth])
+            .status()
+            .map_err(|_| CNIError::new(3, "Failed to create veth pair"))?;
+
+        Command::new("ip")
+            .args(&["link", "set", host_veth, "up"])
+            .status()
+            .map_err(|_| CNIError::new(3, "Failed to bring host veth up"))?;
+
+        Ok(())
+    }
+
+    fn move_to_netns(&self, interface: &str, netns: &str) -> Result<(), CNIError> {
+        Command::new("ip")
+            .args(&["link", "set", interface, "netns", netns])
+            .status()
+            .map_err(|_| CNIError::new(3, "Failed to move interface to netns"))?;
+
+        Ok(())
+    }
+
+    fn attach_to_bridge(&self, interface: &str, bridge: &str) -> Result<(), CNIError> {
+        Command::new("ip")
+            .args(&["link", "set", interface, "master", bridge])
+            .status()
+            .map_err(|_| CNIError::new(3, "Failed to attach interface to bridge"))?;
+
+        Ok(())
+    }
+
+    fn allocate_ip(&self) -> Result<Ipv4Addr, CNIError> {
+        // Super basic IP allocation - in real implementation, this would be much more sophisticated
+        // and probably stored in etcd or similar
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        self.args.container_id.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        // Generate IP in 10.244.0.0/24 range
+        let host_part = (hash % 254) as u8 + 2; // avoid .0 and .1
+        Ok(Ipv4Addr::new(10, 244, 0, host_part))
+    }
+
+    fn configure_container_ip(&self, ip: &Ipv4Addr, interface: &str) -> Result<(), CNIError> {
+        let netns = &self.args.netns;
+
+        // Configure IP inside the container netns
+        Command::new("ip")
+            .args(&["netns", "exec", netns, "ip", "addr", "add",
+                &format!("{}/24", ip), "dev", interface])
+            .status()
+            .map_err(|_| CNIError::new(3, "Failed to set container IP"))?;
+
+        Command::new("ip")
+            .args(&["netns", "exec", netns, "ip", "link", "set", interface, "up"])
+            .status()
+            .map_err(|_| CNIError::new(3, "Failed to bring container interface up"))?;
+
+        // Set default route
+        Command::new("ip")
+            .args(&["netns", "exec", netns, "ip", "route", "add", "default", "via", "10.244.0.1"])
+            .status()
+            .map_err(|_| CNIError::new(3, "Failed to set default route"))?;
+
+        Ok(())
+    }
+
+    // TODO: eBPF integration methods
+    // fn load_ebpf_programs(&self) -> Result<(), CNIError> {
+    //     // Load eBPF programs for traffic shaping, security policies, etc.
+    //     Ok(())
+    // }
+
+    // fn unload_ebpf_programs(&self) -> Result<(), CNIError> {
+    //     // Clean up eBPF programs
+    //     Ok(())
+    // }
+}
+
+fn main() {
+    let command = env::var("CNI_COMMAND").unwrap_or_else(|_| "".to_string());
+
+    let cni = match EbpfCNI::new() {
+        Ok(cni) => cni,
+        Err(e) => {
+            eprintln!("{{\"code\":{},\"msg\":\"{}\"}}", e.code, e.msg);
+            std::process::exit(1);
+        }
+    };
+
+    let result = match command.as_str() {
+        "ADD" => {
+            match cni.cmd_add() {
+                Ok(result) => {
+                    println!("{}", serde_json::to_string(&result).unwrap());
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("{{\"code\":{},\"msg\":\"{}\"}}", e.code, e.msg);
+                    std::process::exit(1);
+                }
+            }
+        }
+        "DEL" => {
+            match cni.cmd_del() {
+                Ok(_) => std::process::exit(0),
+                Err(e) => {
+                    eprintln!("{{\"code\":{},\"msg\":\"{}\"}}", e.code, e.msg);
+                    std::process::exit(1);
+                }
+            }
+        }
+        "CHECK" => {
+            match cni.cmd_check() {
+                Ok(_) => std::process::exit(0),
+                Err(e) => {
+                    eprintln!("{{\"code\":{},\"msg\":\"{}\"}}", e.code, e.msg);
+                    std::process::exit(1);
+                }
+            }
+        }
+        "VERSION" => {
+            let version = r#"{"cniVersion":"1.0.0","supportedVersions":["0.3.0","0.3.1","0.4.0","1.0.0"]}"#;
+            println!("{}", version);
+            std::process::exit(0);
+        }
+        _ => {
+            eprintln!("{{\"code\":7,\"msg\":\"unknown CNI command: {}\"}}", command);
+            std::process::exit(1);
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::env;
+    use std::fs;
     use std::io::Write;
-    use tempfile::NamedTempFile;
-
-    #[test]
-    fn test_cni_command_from_env() {
-        // Test ADD command
-        // unsafe {env::set_var("CNI_COMMAND", "ADD")};
-        setup_test_env("ADD", "test-container-123", "/proc/1234/ns/net", "eth0");
-        
-        let cmd = CniCommand::from_env().unwrap();
-        assert!(matches!(cmd, CniCommand::Add));
-
-        // Test DEL command
-        unsafe {env::set_var("CNI_COMMAND", "DEL")};
-        let cmd = CniCommand::from_env().unwrap();
-        assert!(matches!(cmd, CniCommand::Del));
-    }
-
-    #[test]
-    fn test_cni_environment_from_env() {
-        setup_test_env("ADD", "test-container-456", "/proc/1234/ns/net", "eth0");
-
-        let env = CniEnvironment::from_env().unwrap();
-
-        assert!(matches!(env.command, CniCommand::Add));
-        assert_eq!(env.container_id, Some("test-container-456".to_string()));
-        assert_eq!(env.netns, Some("/proc/1234/ns/net".to_string()));
-        assert_eq!(env.ifname, Some("eth0".to_string()));
-    }
-
-    #[test]
-    fn test_handle_version() {
-        let cni = Cni::new();
-        let result = cni.handle_version();
-        assert!(result.is_ok());
-        // Note: We can't easily test stdout in this case without refactoring
-    }
-
-    #[test]
-    fn test_config_load() {
-        // Create a temp config file
-        let mut temp_file = NamedTempFile::new().unwrap();
-        writeln!(temp_file, "{{\"cniVersion\": \"1.0.0\"}}").unwrap();
-
-        let mut config = Config::new();
-        config.file = temp_file.path().to_str().unwrap().to_string();
-
-        let result = config.load();
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_version_info_json() {
-        let version_info = serde_json::json!({
-            "cniVersion": CNI_VERSION_1_0_0,
-            "supportedVersions": [CNI_VERSION_1_0_0]
-        });
-
-        let json_str = serde_json::to_string(&version_info).unwrap();
-        assert!(json_str.contains("1.0.0"));
-        assert!(json_str.contains("supportedVersions"));
-    }
-}
-
-// #[test]
-// fn test_cni_command_from_env() {
-//     // Remove unsafe keywords
-//     unsafe { env::set_var("CNI_COMMAND", "ADD")};
-//     let cmd = CniCommand::from_env().unwrap();
-//     assert!(matches!(cmd, CniCommand::Add));
-//
-//     // And so on...
-// }
-
-#[cfg(test)]
-mod integration_tests {
-    use super::*;
-    use std::env;
-    use std::io::{self, Write};
     use std::process::{Command, Stdio};
     use tempfile::NamedTempFile;
 
-    // Helper to simulate stdin input
-    fn with_stdin_from_str<F>(input: &str, f: F)
-    where
-        F: FnOnce(),
-    {
-        // Save original stdin
-        let orig_stdin = io::stdin();
+    // Helper function to create a test CNI config
+    fn create_test_config() -> CNIConfig {
+        CNIConfig {
+            cni_version: "1.0.0".to_string(),
+            name: "ebpf-cni-test".to_string(),
+            plugin_type: "ebpf-cni".to_string(),
+            bridge: Some("test-br0".to_string()),
+            is_gateway: Some(true),
+            is_default_gateway: Some(true),
+            force_address: None,
+            ip_masq: Some(true),
+            mtu: Some(1500),
+            hairpin_mode: Some(true),
+            ipam: Some(IPAMConfig {
+                plugin_type: "host-local".to_string(),
+                subnet: Some("10.244.0.0/24".to_string()),
+                range_start: Some("10.244.0.10".to_string()),
+                range_end: Some("10.244.0.250".to_string()),
+                gateway: Some("10.244.0.1".to_string()),
+                routes: Some(vec![Route {
+                    dst: "0.0.0.0/0".to_string(),
+                    gw: Some("10.244.0.1".to_string()),
+                }]),
+            }),
+        }
+    }
 
-        // Create a pipe to simulate stdin
-        let mut child = Command::new("echo")
-            .arg(input)
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("Failed to spawn echo process");
+    // Helper function to set up test environment variables
+    fn setup_test_env() -> (String, String, String) {
+        let container_id = "test-container-123456789abcdef".to_string();
+        let netns = "/var/run/netns/test-ns".to_string();
+        let if_name = "eth0".to_string();
 
-        // Run the test - in real implementation you'd set stdin
-        // This is a simplified example
-        f();
+        unsafe { env::set_var("CNI_CONTAINERID", &container_id)};
+        unsafe { env::set_var("CNI_NETNS", &netns)};
+        unsafe { env::set_var("CNI_IFNAME", &if_name)};
+        unsafe { env::set_var("CNI_PATH", "/opt/cni/bin")};
+        unsafe { env::set_var("CNI_COMMAND", "ADD")};
 
-        let _ = child.wait();
+        (container_id, netns, if_name)
+    }
+
+    // Helper to clean up test environment
+    fn cleanup_test_env() {
+        unsafe { env::remove_var("CNI_CONTAINERID")};
+        unsafe {env::remove_var("CNI_NETNS")};
+        unsafe { env::remove_var("CNI_IFNAME")};
+        unsafe { env::remove_var("CNI_PATH")};
+        unsafe { env::remove_var("CNI_COMMAND")};
     }
 
     #[test]
-    fn test_basic_add_workflow() {
-        setup_test_env("ADD", "test-container-123", "/proc/1234/ns/net", "eth0");
+    fn test_cni_config_serialization() {
+        let config = create_test_config();
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: CNIConfig = serde_json::from_str(&json).unwrap();
 
-        let config_json = r#"{
-        "cniVersion": "1.0.0",
-        "name": "upcloud-network",
-        "type": "upcloud",
-        "subnet": "10.10.0.0/16",
-        "mock": true,
-        "ipam": {
-            "type": "upcloud-ipam",
-            "subnet": "10.10.0.0/16",
-            "gateway": "10.10.0.1"
+        assert_eq!(config.cni_version, deserialized.cni_version);
+        assert_eq!(config.name, deserialized.name);
+        assert_eq!(config.plugin_type, deserialized.plugin_type);
+        assert_eq!(config.bridge, deserialized.bridge);
+    }
+
+    #[test]
+    fn test_cni_result_serialization() {
+        let result = CNIResult {
+            cni_version: "1.0.0".to_string(),
+            interfaces: vec![
+                Interface {
+                    name: "test-br0".to_string(),
+                    mac: Some("aa:bb:cc:dd:ee:ff".to_string()),
+                    sandbox: None,
+                },
+                Interface {
+                    name: "eth0".to_string(),
+                    mac: Some("ff:ee:dd:cc:bb:aa".to_string()),
+                    sandbox: Some("/var/run/netns/test".to_string()),
+                },
+            ],
+            ips: vec![IPConfig {
+                address: "10.244.0.100/24".to_string(),
+                gateway: Some("10.244.0.1".to_string()),
+                interface: Some(1),
+            }],
+            routes: Some(vec![Route {
+                dst: "0.0.0.0/0".to_string(),
+                gw: Some("10.244.0.1".to_string()),
+            }]),
+            dns: Some(DNSConfig {
+                nameservers: vec!["8.8.8.8".to_string()],
+                domain: Some("cluster.local".to_string()),
+                search: Some(vec!["default.svc.cluster.local".to_string()]),
+                options: None,
+            }),
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        let deserialized: CNIResult = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(result.cni_version, deserialized.cni_version);
+        assert_eq!(result.interfaces.len(), deserialized.interfaces.len());
+        assert_eq!(result.ips.len(), deserialized.ips.len());
+    }
+
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    struct CNIArgs {
+        container_id: String,
+        netns: String,
+        if_name: String,
+        args: None,
+        path: "/test".to_string(),
+    }
+    
+    #[test]
+    fn test_ip_allocation_consistency() {
+        let container_id = "test-container-123";
+
+
+        let mut cni_args = CNIArgs {
+            container_id: container_id.to_string(),
+            netns: "/test".to_string(),
+            if_name: "eth0".to_string(),
+            path: "/test".to_string(),
+        };
+
+        let cni = EbpfCNI {
+            config: create_test_config(),
+            args: cni_args.clone(),
+        };
+
+        // Same container ID should get same IP
+        let ip1 = cni.allocate_ip().unwrap();
+        let ip2 = cni.allocate_ip().unwrap();
+        assert_eq!(ip1, ip2);
+
+        // Different container ID should get different IP
+        cni_args.container_id = "different-container-456".to_string();
+        let cni2 = EbpfCNI {
+            config: create_test_config(),
+            args: cni_args,
+        };
+        let ip3 = cni2.allocate_ip().unwrap();
+        assert_ne!(ip1, ip3);
+    }
+
+    #[test]
+    fn test_ip_allocation_range() {
+        let cni = EbpfCNI {
+            config: create_test_config(),
+            args: CNIArgs {
+                container_id: "test".to_string(),
+                netns: "/test".to_string(),
+                if_name: "eth0".to_string(),
+                args: None,
+                path: "/test".to_string(),
+            },
+        };
+
+        let ip = cni.allocate_ip().unwrap();
+
+        // Should be in 10.244.0.0/24 range
+        assert_eq!(ip.octets()[0], 10);
+        assert_eq!(ip.octets()[1], 244);
+        assert_eq!(ip.octets()[2], 0);
+
+        // Should not be .0 or .1 (reserved)
+        assert!(ip.octets()[3] >= 2);
+        assert!(ip.octets()[3] <= 255);
+    }
+
+    #[test]
+    fn test_cni_error_creation() {
+        let error = CNIError::new(2, "Test error message");
+        assert_eq!(error.code, 2);
+        assert_eq!(error.msg, "Test error message");
+        assert!(error.details.is_none());
+    }
+
+    #[test]
+    fn test_missing_env_vars() {
+        cleanup_test_env();
+
+        // Should fail without required env vars
+        let result = EbpfCNI::new();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_env_var_parsing() {
+        setup_test_env();
+
+        // Create a temporary config file
+        let config = create_test_config();
+        let config_json = serde_json::to_string(&config).unwrap();
+
+        // We can't easily test stdin reading in unit tests, but we can test
+        // the parsing logic separately
+        let parsed: CNIConfig = serde_json::from_str(&config_json).unwrap();
+        assert_eq!(parsed.name, "ebpf-cni-test");
+
+        cleanup_test_env();
+    }
+
+    #[test]
+    fn test_veth_naming() {
+        let container_id = "test-container-123456789abcdef";
+        let expected_host_veth = "vethtest-con"; // first 8 chars after prefix
+
+        let host_veth = format!("veth{}", &container_id[..8]);
+        assert_eq!(host_veth, expected_host_veth);
+    }
+
+    #[test]
+    fn test_route_structure() {
+        let route = Route {
+            dst: "192.168.1.0/24".to_string(),
+            gw: Some("192.168.1.1".to_string()),
+        };
+
+        let json = serde_json::to_string(&route).unwrap();
+        let parsed: Route = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(route.dst, parsed.dst);
+        assert_eq!(route.gw, parsed.gw);
+    }
+
+    #[test]
+    fn test_interface_structure() {
+        let interface = Interface {
+            name: "eth0".to_string(),
+            mac: Some("aa:bb:cc:dd:ee:ff".to_string()),
+            sandbox: Some("/var/run/netns/test".to_string()),
+        };
+
+        let json = serde_json::to_string(&interface).unwrap();
+        let parsed: Interface = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(interface.name, parsed.name);
+        assert_eq!(interface.mac, parsed.mac);
+        assert_eq!(interface.sandbox, parsed.sandbox);
+    }
+
+    #[test]
+    fn test_dns_config() {
+        let dns = DNSConfig {
+            nameservers: vec!["8.8.8.8".to_string(), "1.1.1.1".to_string()],
+            domain: Some("example.com".to_string()),
+            search: Some(vec!["example.com".to_string(), "test.com".to_string()]),
+            options: Some(vec!["ndots:2".to_string()]),
+        };
+
+        let json = serde_json::to_string(&dns).unwrap();
+        let parsed: DNSConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(dns.nameservers, parsed.nameservers);
+        assert_eq!(dns.domain, parsed.domain);
+        assert_eq!(dns.search, parsed.search);
+        assert_eq!(dns.options, parsed.options);
+    }
+
+    // Integration-style tests (these would need root privileges and actual network setup)
+    #[cfg(feature = "integration_tests")]
+    mod integration_tests {
+        use super::*;
+
+        #[test]
+        #[ignore] // Run with --ignored flag and root privileges
+        fn test_bridge_creation() {
+            let cni = EbpfCNI {
+                config: create_test_config(),
+                args: CNIArgs {
+                    container_id: "test".to_string(),
+                    netns: "/test".to_string(),
+                    if_name: "eth0".to_string(),
+                    args: None,
+                    path: "/test".to_string(),
+                },
+            };
+
+            let bridge_name = "test-integration-br0";
+
+            // Clean up any existing bridge
+            let _ = Command::new("ip")
+                .args(&["link", "del", bridge_name])
+                .output();
+
+            // Test bridge creation
+            let result = cni.ensure_bridge(bridge_name);
+            assert!(result.is_ok());
+
+            // Verify bridge exists
+            let output = Command::new("ip")
+                .args(&["link", "show", bridge_name])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+
+            // Clean up
+            let _ = Command::new("ip")
+                .args(&["link", "del", bridge_name])
+                .output();
         }
-    }"#;
 
-        let cni = Cni::new();
-        let env = CniEnvironment::from_env().expect("Failed to get environment");
-        let result = cni.handle_add(config_json, &env);
+        #[test]
+        #[ignore] // Run with --ignored flag and root privileges
+        fn test_veth_creation() {
+            let cni = EbpfCNI {
+                config: create_test_config(),
+                args: CNIArgs {
+                    container_id: "test".to_string(),
+                    netns: "/test".to_string(),
+                    if_name: "eth0".to_string(),
+                    args: None,
+                    path: "/test".to_string(),
+                },
+            };
 
-        assert!(result.is_ok());
+            let host_veth = "test-host-veth";
+            let container_veth = "test-container-veth";
 
+            // Clean up any existing interfaces
+            let _ = Command::new("ip")
+                .args(&["link", "del", host_veth])
+                .output();
+
+            // Test veth creation
+            let result = cni.create_veth_pair(host_veth, container_veth);
+            assert!(result.is_ok());
+
+            // Verify veth pair exists
+            let output = Command::new("ip")
+                .args(&["link", "show", host_veth])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+
+            // Clean up
+            let _ = Command::new("ip")
+                .args(&["link", "del", host_veth])
+                .output();
+        }
+    }
+
+    // Benchmark tests for performance-critical operations
+    #[cfg(feature = "bench")]
+    mod bench_tests {
+        use super::*;
+        use std::time::Instant;
+
+        #[test]
+        fn bench_ip_allocation() {
+            let cni = EbpfCNI {
+                config: create_test_config(),
+                args: CNIArgs {
+                    container_id: "bench-test".to_string(),
+                    netns: "/test".to_string(),
+                    if_name: "eth0".to_string(),
+                    args: None,
+                    path: "/test".to_string(),
+                },
+            };
+
+            let start = Instant::now();
+            for _ in 0..1000 {
+                let _ = cni.allocate_ip();
+            }
+            let duration = start.elapsed();
+
+            println!("1000 IP allocations took: {:?}", duration);
+            assert!(duration.as_millis() < 100); // Should be very fast
+        }
+
+        #[test]
+        fn bench_json_parsing() {
+            let config = create_test_config();
+            let json = serde_json::to_string(&config).unwrap();
+
+            let start = Instant::now();
+            for _ in 0..1000 {
+                let _: CNIConfig = serde_json::from_str(&json).unwrap();
+            }
+            let duration = start.elapsed();
+
+            println!("1000 JSON parses took: {:?}", duration);
+            assert!(duration.as_millis() < 50); // Should be very fast
+        }
     }
 }
 
-mod upcloud_api_client {
-    use std::env;
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Debug)]
-    pub struct UpcloudClient {
-        api_username: String,
-        api_password: String,
-        mock_mode: bool,
-    }
-
-    impl UpcloudClient {
-        pub fn new(username: &str, password: &str) -> Self {
-            Self {
-                api_username: username.to_string(),
-                api_password: password.to_string(),
-                mock_mode: false,
-            }
-        }
-
-        pub fn from_env() -> Result<Self, String> {
-            let username = env::var("UPCLOUD_API_USERNAME")
-                .map_err(|_| "UPCLOUD_API_USERNAME environment variable not set".to_string())?;
-            let password = env::var("UPCLOUD_API_PASSWORD")
-                .map_err(|_| "UPCLOUD_API_PASSWORD environment variable not set".to_string())?;
-
-            Ok(Self::new(&username, &password))
-        }
-
-        pub fn with_mock() -> Self {
-            Self {
-                api_username: "mock".to_string(),
-                api_password: "mock".to_string(),
-                mock_mode: true,
-            }
-        }
-
-        pub fn create_network_interface(&self, params: &NetworkInterfaceParams) -> Result<NetworkInterface, String> {
-            if self.mock_mode {
-                // Return mock data
-                Ok(NetworkInterface {
-                    id: "0123456789".to_string(),
-                    mac: "00:11:22:33:44:55".to_string(),
-                    ip: params.ip.clone().unwrap_or_else(|| "10.10.0.5".to_string()),
-                })
-            } else {
-                // Make actual HTTP request to UpCloud API
-                let client = reqwest::blocking::Client::new();
-                let response = client.post("https://api.upcloud.com/1.3/network-interface")
-                    .basic_auth(&self.api_username, Some(&self.api_password))
-                    .json(params)
-                    .send()
-                    .map_err(|e| format!("API request failed: {}", e))?;
-
-                if !response.status().is_success() {
-                    return Err(format!("API error: {}", response.status()));
-                }
-
-                response.json::<NetworkInterface>()
-                    .map_err(|e| format!("Failed to parse API response: {}", e))
-            }
-        }
-
-        pub fn delete_network_interface(&self, id: &str) -> Result<(), String> {
-            if self.mock_mode {
-                // Pretend to delete
-                Ok(())
-            } else {
-                // Real deletion logic
-                Err("Real API not implemented yet".to_string())
-            }
-        }
-    }
-
-    #[derive(Debug, Serialize, Deserialize)]
-    pub struct NetworkInterfaceParams {
-        pub network_id: String,
-        pub ip: Option<String>,
-    }
-
-    #[derive(Debug, Serialize, Deserialize)]
-    pub struct NetworkInterface {
-        pub id: String,
-        pub mac: String,
-        pub ip: String,
-    }
-}
-
-fn run_cni_with_mock_and_capture_output(config_json: &str) -> Result<CniResult, String> {
-    let cni = Cni::new();
-
-    // Run the CNI command with our mocked input
-    let result_json = cni.handle_add_and_capture(config_json,
-                                                 &CniEnvironment::from_env().expect("Failed to get environment"))?;
-
-    // Parse the JSON result
-    let result: CniResult = serde_json::from_str(&result_json)
-        .map_err(|e| format!("Failed to parse result: {}", e))?;
-
-    Ok(result)
-}
-
-#[test]
-fn test_add_with_mocked_upcloud_api() {
-    unsafe { env::remove_var("CNI_COMMAND")} ;
-    unsafe { env::remove_var("CNI_CONTAINERID")};
-    unsafe { env::remove_var("CNI_NETNS")};
-    unsafe { env::remove_var("CNI_IFNAME")};
-
-    // Setup environment
-    unsafe { env::set_var("CNI_COMMAND", "ADD")};
-    unsafe { env::set_var("CNI_CONTAINERID", "test-container-456")};
-    unsafe { env::set_var("CNI_NETNS", "/proc/5678/ns/net")};
-    unsafe { env::set_var("CNI_IFNAME", "eth0")};
-
-    // Prepare test config with mock flag
-    let config_json = r#"{
-        "cniVersion": "1.0.0",
-        "name": "upcloud-network",
-        "type": "upcloud",
-        "subnet": "10.10.0.0/16",
-        "mock": true,
-        "ipam": {
-            "type": "upcloud-ipam",
-            "subnet": "10.10.0.0/16",
-            "gateway": "10.10.0.1"
-        }
-    }"#;
-
-    // Run test with mocked API
-    let actual_result = run_cni_with_mock_and_capture_output(config_json)
-        .expect("Failed to run CNI");
-
-    // Create expected result based on the ACTUAL implementation
-    // This avoids potential subtle differences in how strings are created
-    let expected_result = CniResult {
-        cni_version: "1.0.0".to_string(),
-        interfaces: vec![Interface {
-            name: env::var("CNI_IFNAME").unwrap_or_else(|_| "eth0".to_string()),
-            mac: "00:11:22:33:44:55".to_string(),
-            sandbox: Some(env::var("CNI_NETNS").unwrap()),
-        }],
-        ips: vec![IPConfig {
-            version: "4".to_string(),
-            address: "10.10.0.5/16".to_string(),
-            gateway: Some("10.10.0.1".to_string()),
-        }],
-        dns: None,
-    };
-
-    // Print debug information
-    println!("Expected: {:?}", expected_result);
-    println!("Actual:   {:?}", actual_result);
-
-    // Compare individual fields
-    assert_eq!(actual_result.cni_version, expected_result.cni_version, "cni_version mismatch");
-    assert_eq!(actual_result.interfaces.len(), expected_result.interfaces.len(), "interfaces length mismatch");
-
-    for (i, (act, exp)) in actual_result.interfaces.iter().zip(expected_result.interfaces.iter()).enumerate() {
-        assert_eq!(act.name, exp.name, "interface[{}].name mismatch", i);
-        assert_eq!(act.mac, exp.mac, "interface[{}].mac mismatch", i);
-        assert_eq!(act.sandbox, exp.sandbox, "interface[{}].sandbox mismatch", i);
-    }
-
-    assert_eq!(actual_result.ips.len(), expected_result.ips.len(), "ips length mismatch");
-
-    for (i, (act, exp)) in actual_result.ips.iter().zip(expected_result.ips.iter()).enumerate() {
-        assert_eq!(act.version, exp.version, "ips[{}].version mismatch", i);
-        assert_eq!(act.address, exp.address, "ips[{}].address mismatch", i);
-        assert_eq!(act.gateway, exp.gateway, "ips[{}].gateway mismatch", i);
-    }
-
-    assert_eq!(actual_result.dns, expected_result.dns, "dns mismatch");
-}
-
+// Test utilities for external testing
 #[cfg(test)]
-fn setup_test_env(command: &str, container_id: &str, netns: &str, ifname: &str) {
-    // Clear previous environment
-    unsafe { env::remove_var("CNI_COMMAND")};
-    unsafe { env::remove_var("CNI_CONTAINERID")};
-    unsafe { env::remove_var("CNI_NETNS")};
-    unsafe { env::remove_var("CNI_IFNAME")};
+pub mod test_utils {
+    use super::*;
 
-    // Set new values
-    unsafe { env::set_var("CNI_COMMAND", command)};
-    unsafe { env::set_var("CNI_CONTAINERID", container_id)};
-    unsafe { env::set_var("CNI_NETNS", netns)};
-    unsafe { env::set_var("CNI_IFNAME", ifname)};
+    pub fn create_mock_cni() -> EbpfCNI {
+        EbpfCNI {
+            config: CNIConfig {
+                cni_version: "1.0.0".to_string(),
+                name: "mock-cni".to_string(),
+                plugin_type: "ebpf-cni".to_string(),
+                bridge: Some("mock-br0".to_string()),
+                is_gateway: Some(true),
+                is_default_gateway: Some(true),
+                force_address: None,
+                ip_masq: Some(true),
+                mtu: Some(1500),
+                hairpin_mode: Some(true),
+                ipam: None,
+            },
+            args: CNIArgs {
+                container_id: "mock-container".to_string(),
+                netns: "/mock/netns".to_string(),
+                if_name: "eth0".to_string(),
+                args: None,
+                path: "/mock/path".to_string(),
+            },
+        }
+    }
+
+    pub fn assert_valid_ipv4(ip_str: &str) {
+        let _: std::net::Ipv4Addr = ip_str.parse().expect("Invalid IPv4 address");
+    }
+
+    pub fn assert_valid_cidr(cidr: &str) {
+        let parts: Vec<&str> = cidr.split('/').collect();
+        assert_eq!(parts.len(), 2);
+        assert_valid_ipv4(parts[0]);
+        let prefix: u8 = parts[1].parse().expect("Invalid CIDR prefix");
+        assert!(prefix <= 32);
+    }
 }
